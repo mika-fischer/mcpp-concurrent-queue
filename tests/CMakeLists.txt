@@ -8,7 +8,10 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(tests
     basic.cpp
     concurrent_queue.cpp
+    oneshot.cpp
     select.cpp
+    spinlock.cpp
+    synchronized_value.cpp
     thread_parker.cpp
 )
 target_link_libraries(tests

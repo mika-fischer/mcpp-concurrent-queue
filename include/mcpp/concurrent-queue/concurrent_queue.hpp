@@ -70,68 +70,57 @@ struct try_recv_result {
     friend auto operator!=(try_recv_result lhs, try_recv_result rhs) noexcept -> bool { return !(lhs == rhs); }
 };
 
+class pending_op {
+  private:
+    oneshot *oneshot_{nullptr};
+
+  public:
+    virtual ~pending_op() = default;
+
+    pending_op(const pending_op &) = delete;
+    pending_op(pending_op &&) = delete;
+    auto operator=(const pending_op &) -> pending_op & = delete;
+    auto operator=(pending_op &&) -> pending_op & = delete;
+
+    [[nodiscard]] auto available() const noexcept -> bool {
+        assert(oneshot_ != nullptr);
+        return oneshot_->available();
+    }
+
+  protected:
+    explicit pending_op(oneshot *oneshot = nullptr) noexcept : oneshot_{oneshot} {}
+
+    void emplace(oneshot *oneshot) noexcept {
+        assert(oneshot_ == nullptr);
+        oneshot_ = oneshot;
+    }
+
+    auto get_oneshot() noexcept -> oneshot & {
+        assert(oneshot_ != nullptr);
+        return *oneshot_;
+    }
+};
+
+template <typename T>
+class pending_recv;
+
 template <typename T>
 struct Chan;
 
-class pending_op_base {
-  public:
-    pending_op_base() = default;
-    virtual ~pending_op_base() = default;
-
-    pending_op_base(const pending_op_base &) = delete;
-    pending_op_base(pending_op_base &&) = delete;
-    auto operator=(const pending_op_base &) -> pending_op_base & = delete;
-    auto operator=(pending_op_base &&) -> pending_op_base & = delete;
-};
-
 template <typename T>
-class pending_op : public pending_op_base {
+class pending_send : public pending_op {
   private:
-    synchronized_value<Chan<T>> *chan_{nullptr};
-
-  protected:
-    explicit pending_op() = default;
-    explicit pending_op(synchronized_value<Chan<T>> &chan) : chan_(&chan) {}
-
-    [[nodiscard]] auto empty() const noexcept -> bool { return chan_ == nullptr; }
-    auto chan() noexcept -> synchronized_value<Chan<T>> & { return *chan_; }
-};
-
-template <typename T>
-class pending_send : public pending_op<T> {
-  public:
-    using pending_op<T>::pending_op;
-    virtual auto try_resolve(op_status status) noexcept -> std::optional<T> = 0;
-    auto try_cancel() noexcept -> bool;
-};
-
-template <typename T>
-class pending_recv : public pending_op<T> {
-  public:
-    using pending_op<T>::pending_op;
-    virtual auto try_resolve(T &&value) noexcept -> bool = 0;
-    virtual auto try_resolve(const T &value) noexcept -> bool = 0;
-    virtual void resolve_closed() noexcept = 0;
-    auto try_cancel() noexcept -> bool;
-};
-
-using sync_oneshot = oneshot<thread_parker<> &>;
-
-template <typename T>
-class blocking_send : public pending_send<T> {
-  private:
-    sync_oneshot oneshot_{thread_parker<>::this_thread_parker()};
-    std::optional<op_status> status_;
     T *move_value_{nullptr};
     const T *copy_value_{nullptr};
+    std::optional<op_status> status_;
 
   public:
-    explicit blocking_send(synchronized_value<Chan<T>> &chan, T &val) : pending_send<T>(chan), move_value_(&val) {}
-    explicit blocking_send(synchronized_value<Chan<T>> &chan, const T &val)
-        : pending_send<T>(chan), copy_value_(&val) {}
+    pending_send() = default;
+    explicit pending_send(T &&value, oneshot *oneshot = nullptr) : pending_op(oneshot), move_value_(&value) {}
+    explicit pending_send(const T &value, oneshot *oneshot = nullptr) : pending_op(oneshot), copy_value_(&value) {}
 
-    auto try_resolve(op_status status) noexcept -> std::optional<T> override {
-        return oneshot_.try_resolve([&]() -> std::optional<T> {
+    auto try_resolve(op_status status) noexcept -> std::optional<T> {
+        return get_oneshot().try_resolve([&]() -> std::optional<T> {
             status_ = status;
             if (status_ == op_status::success) {
                 return move_value_ ? std::move(*move_value_) : *copy_value_;
@@ -141,97 +130,104 @@ class blocking_send : public pending_send<T> {
     }
 
     template <typename Clock = std::chrono::steady_clock, typename Duration = typename Clock::duration>
-    auto try_send(std::optional<std::chrono::time_point<Clock, Duration>> deadline = std::nullopt) -> try_op_status {
+    auto try_send(synchronized_value<Chan<T>> &chan,
+                  std::optional<std::chrono::time_point<Clock, Duration>> deadline = std::nullopt) -> try_op_status {
         // TODO: Handle exception in wait_done_until & wait_done
-        if (auto done = oneshot_.wait_done(deadline)) {
+        if (auto done = get_oneshot().wait_done(deadline)) {
             return make_try_send_status(*done);
         }
-        if (oneshot_.try_cancel() && this->try_cancel()) {
-            return try_op_status::wouldblock;
+        if (get_oneshot().try_cancel() && chan.lock()->pending_sends.try_remove(this)) {
+            // there's nobody on the other side and there never will be, so we set the status to cancelled ourselves
+            auto result = get_oneshot().try_resolve([] { return true; });
+            assert(!result);
         }
-        return make_try_send_status(*oneshot_.wait_done());
+        auto result = make_try_send_status(*get_oneshot().wait_done());
+        assert(get_oneshot().done());
+        return result;
     }
 
   private:
-    auto make_try_send_status(oneshot_result result) noexcept -> try_op_status {
+    auto make_try_send_status(oneshot::result result) noexcept -> try_op_status {
         switch (result) {
-            case oneshot_result::resolved:
+            case oneshot::result::resolved:
                 return to_try_op_status(*status_);
-            case oneshot_result::canceled:
+            case oneshot::result::canceled:
                 return try_op_status::wouldblock;
             default:
                 std::terminate();
         }
     }
+
+    friend class pending_recv<T>;
 };
 
 template <typename T>
-class blocking_recv : public pending_recv<T> {
+class pending_recv : public pending_op {
   private:
-    sync_oneshot *oneshot_{nullptr};
     std::optional<recv_result<T>> result_;
 
   public:
-    explicit blocking_recv() = default;
-    explicit blocking_recv(synchronized_value<Chan<T>> &chan, sync_oneshot &oneshot)
-        : pending_recv<T>(chan), oneshot_(&oneshot) {}
+    explicit pending_recv(oneshot *oneshot = nullptr) : pending_op(oneshot) {}
 
-    void emplace(synchronized_value<Chan<T>> &chan, sync_oneshot &oneshot) {
-        assert(this->chan_ == nullptr);
-        assert(oneshot_ == nullptr);
-        this->chan_ = &chan;
-        oneshot_ = &oneshot;
+    auto try_resolve(pending_send<T> &send) noexcept -> bool {
+        return try_resolve2(send.get_oneshot(), get_oneshot(), [&]() -> bool {
+            result_ = recv_result<T>{op_status::success};
+            if (send.move_value_) {
+                result_->value.emplace(std::move(*send.move_value_));
+            } else {
+                result_->value.emplace(*send.copy_value_);
+            }
+            send.status_ = op_status::success;
+            return true;
+        });
     }
 
-    auto try_resolve(T &&value) noexcept -> bool override {
-        return oneshot_->try_resolve([&] {
+    auto try_resolve(T &&value) noexcept -> bool {
+        return get_oneshot().try_resolve([&] {
             result_ = recv_result<T>{op_status::success, std::move(value)};
             return true;
         });
     }
 
-    auto try_resolve(const T &value) noexcept -> bool override {
-        return oneshot_->try_resolve([&] {
+    auto try_resolve(const T &value) noexcept -> bool {
+        return get_oneshot().try_resolve([&] {
             result_ = recv_result<T>{op_status::success, value};
             return true;
         });
     }
 
-    void resolve_closed() noexcept override {
-        oneshot_->try_resolve([&] {
+    void resolve_closed() noexcept {
+        get_oneshot().try_resolve([&] {
             result_ = recv_result<T>{op_status::closed, std::nullopt};
             return true;
         });
     }
 
-    auto recv() -> recv_result<T> {
-        // TODO: Handle exception in wait_done
-        switch (*oneshot_->wait_done()) {
-            case oneshot_result::resolved:
-                return std::move(*result_);
-            case oneshot_result::canceled:
-                std::terminate();
-        }
-    }
-
     template <typename Clock = std::chrono::steady_clock, typename Duration = typename Clock::duration>
-    auto try_recv(std::optional<std::chrono::time_point<Clock, Duration>> deadline = {}) -> try_recv_result<T> {
+    auto try_recv(synchronized_value<Chan<T>> &chan,
+                  std::optional<std::chrono::time_point<Clock, Duration>> deadline = {}) -> try_recv_result<T> {
         // TODO: Handle exception in wait_done_until & wait_done
-        if (auto done = oneshot_->wait_done(deadline)) {
-            return make_try_recv_result(*done);
+        if (auto done = get_oneshot().wait_done(deadline)) {
+            auto result = make_try_recv_result(*done);
+            assert(deadline || get_oneshot().done());
+            return result;
         }
-        if (oneshot_->try_cancel() && this->try_cancel()) {
-            return {try_op_status::wouldblock, std::nullopt};
+        if (get_oneshot().try_cancel() && chan.lock()->pending_recvs.try_remove(this)) {
+            // there's nobody on the other side and there never will be, so we set the status to cancelled ourselves
+            auto result = get_oneshot().try_resolve([] { return true; });
+            assert(!result);
         }
-        return make_try_recv_result(*oneshot_->wait_done());
+        auto result = make_try_recv_result(*get_oneshot().wait_done());
+        assert(get_oneshot().done());
+        return result;
     }
 
   private:
-    auto make_try_recv_result(oneshot_result result) noexcept -> try_recv_result<T> {
+    auto make_try_recv_result(oneshot::result result) noexcept -> try_recv_result<T> {
         switch (result) {
-            case oneshot_result::resolved:
+            case oneshot::result::resolved:
                 return {to_try_op_status(result_->status), std::move(result_->value)};
-            case oneshot_result::canceled:
+            case oneshot::result::canceled:
                 return {try_op_status::wouldblock, std::nullopt};
             default:
                 std::terminate();
@@ -247,6 +243,9 @@ class pending_op_queue {
   public:
     auto push(T *op) -> void { pending_ops_.push_back(op); }
 
+    auto empty() -> bool { return pending_ops_.empty(); }
+    auto front() -> T * { return pending_ops_.front(); }
+
     auto pop() -> T * {
         if (pending_ops_.empty()) {
             return nullptr;
@@ -256,7 +255,7 @@ class pending_op_queue {
         return op;
     }
 
-    auto remove(const T *op) -> bool {
+    auto try_remove(const T *op) -> bool {
         auto it = std::find(pending_ops_.begin(), pending_ops_.end(), op);
         if (it == pending_ops_.end()) {
             return false;
@@ -265,23 +264,6 @@ class pending_op_queue {
         return true;
     };
 };
-
-template <typename T>
-struct Chan {
-    std::deque<T> queue;
-    pending_op_queue<pending_send<T>> pending_sends;
-    pending_op_queue<pending_recv<T>> pending_recvs;
-};
-
-template <typename T>
-inline auto pending_send<T>::try_cancel() noexcept -> bool {
-    return this->empty() || this->chan().lock()->pending_sends.remove(this);
-}
-
-template <typename T>
-inline auto pending_recv<T>::try_cancel() noexcept -> bool {
-    return this->empty() || this->chan().lock()->pending_recvs.remove(this);
-}
 
 class concurrent_queue_base {
   protected:
@@ -293,6 +275,102 @@ class concurrent_queue_base {
 
     auto capacity() const noexcept -> const std::optional<std::size_t> & { return capacity_; }
     auto closed() const noexcept -> bool { return closed_.load(std::memory_order_seq_cst); }
+
+    template <typename T>
+    friend struct Chan;
+};
+
+template <typename T>
+struct Chan {
+    concurrent_queue_base &queue_;
+    std::deque<T> queue;
+    pending_op_queue<pending_send<T>> pending_sends;
+    pending_op_queue<pending_recv<T>> pending_recvs;
+
+    Chan(concurrent_queue_base &queue) : queue_(queue) {}
+
+    auto push(pending_recv<T> &op) -> bool {
+        if (!queue.empty()) {
+            if (op.try_resolve(std::move(queue.front()))) {
+                queue.pop_front();
+                // Try to resolve one pending send and move into queue
+                while (auto *send = pending_sends.pop()) {
+                    if (auto value = send->try_resolve(op_status::success)) {
+                        queue.emplace_back(std::move(*value));
+                        break;
+                    }
+                }
+            }
+            return false;
+        }
+        while (!pending_sends.empty()) {
+            if (op.try_resolve(*pending_sends.front())) {
+                pending_sends.pop();
+                return false;
+            }
+            if (!op.available()) {
+                // printf("op canceled\n");
+                // op canceled
+                return false;
+            }
+            assert(!pending_sends.front()->available());
+            pending_sends.pop();
+        }
+        if (queue_.closed()) {
+            op.resolve_closed();
+            return false;
+        }
+        pending_recvs.push(&op);
+        return true;
+    }
+
+    auto try_recv_impl() -> try_recv_result<T> {
+        if (!queue.empty()) {
+            auto result = try_recv_result<T>{try_op_status::success, std::move(queue.front())};
+            queue.pop_front();
+            // Try to resolve one pending send and move into queue
+            while (auto *send = pending_sends.pop()) {
+                if (auto value = send->try_resolve(op_status::success)) {
+                    queue.emplace_back(std::move(*value));
+                    break;
+                }
+            }
+            return result;
+        }
+        while (auto *send = pending_sends.pop()) {
+            if (auto value = send->try_resolve(op_status::success)) {
+                return try_recv_result<T>{try_op_status::success, std::move(*value)};
+            }
+        }
+        return {queue_.closed() ? try_op_status::closed : try_op_status::wouldblock, std::nullopt};
+    }
+
+    template <typename U>
+    auto try_send_impl(U &&msg) -> try_op_status {
+        if (queue_.closed()) {
+            return try_op_status::closed;
+        }
+        while (auto *recv = pending_recvs.pop()) {
+            if (recv->try_resolve(std::forward<U>(msg))) {
+                return try_op_status::success;
+            }
+        }
+        if (!queue_.capacity() || queue.size() < *queue_.capacity()) {
+            queue.emplace_back(std::forward<U>(msg));
+            return try_op_status::success;
+        }
+        return try_op_status::wouldblock;
+    }
+
+    void close() {
+        queue_.closed_.store(true);
+        while (auto send = pending_sends.pop()) {
+            send->try_resolve(op_status::closed);
+        }
+        while (auto recv = pending_recvs.pop()) {
+            recv->resolve_closed();
+        }
+    }
 };
 
 template <typename T>
@@ -301,73 +379,40 @@ class concurrent_queue : public concurrent_queue_base {
     synchronized_value<Chan<T>> chan_;
     using chan_guard_type = typename synchronized_value<Chan<T>>::guard_proxy;
 
-    template <typename U>
-    auto try_send_impl(chan_guard_type &chan, U &&msg) -> try_op_status {
-        if (closed()) {
-            return try_op_status::closed;
-        }
-        while (auto *recv = chan->pending_recvs.pop()) {
-            if (recv->try_resolve(std::forward<U>(msg))) {
-                return try_op_status::success;
-            }
-        }
-        if (!capacity_ || chan->queue.size() < *capacity_) {
-            chan->queue.emplace_back(std::forward<U>(msg));
-            return try_op_status::success;
-        }
-        return try_op_status::wouldblock;
-    }
-
-    auto try_recv_impl(chan_guard_type &chan) -> try_recv_result<T> {
-        if (!chan->queue.empty()) {
-            auto result = try_recv_result<T>{try_op_status::success, std::move(chan->queue.front())};
-            chan->queue.pop_front();
-            // Try to resolve one pending send and move into queue
-            while (auto *send = chan->pending_sends.pop()) {
-                if (auto value = send->try_resolve(op_status::success)) {
-                    chan->queue.emplace_back(std::move(*value));
-                    break;
-                }
-            }
-            return result;
-        }
-        while (auto *send = chan->pending_sends.pop()) {
-            if (auto value = send->try_resolve(op_status::success)) {
-                return try_recv_result<T>{try_op_status::success, std::move(*value)};
-            }
-        }
-        return {closed() ? try_op_status::closed : try_op_status::wouldblock, std::nullopt};
-    }
-
     template <typename U, typename Clock = std::chrono::steady_clock, typename Duration = typename Clock::duration>
     auto blocking_send_impl(U &&msg, std::optional<std::chrono::time_point<Clock, Duration>> deadline = std::nullopt)
         -> try_op_status {
         auto chan = chan_.lock();
-        if (auto status = try_send_impl(chan, std::forward<U>(msg)); status != try_op_status::wouldblock) {
+        if (auto status = chan->try_send_impl(std::forward<U>(msg)); status != try_op_status::wouldblock) {
             return status;
         }
-        auto send_op = blocking_send<T>(chan_, std::forward<U>(msg));
+        auto oneshot = sync_oneshot();
+        auto send_op = pending_send<T>(std::forward<U>(msg), &oneshot);
         chan->pending_sends.push(&send_op);
         chan.unlock();
-        return send_op.try_send(deadline);
+        auto result = send_op.try_send(chan_, deadline);
+        assert(oneshot.done());
+        return result;
     }
 
     template <typename Clock = std::chrono::steady_clock, typename Duration = typename Clock::duration>
     auto blocking_recv_impl(std::optional<std::chrono::time_point<Clock, Duration>> deadline = {})
         -> try_recv_result<T> {
         auto chan = chan_.lock();
-        if (auto try_recv_result = try_recv_impl(chan); try_recv_result.status != try_op_status::wouldblock) {
+        if (auto try_recv_result = chan->try_recv_impl(); try_recv_result.status != try_op_status::wouldblock) {
             return try_recv_result;
         }
-        auto oneshot = sync_oneshot{thread_parker<>::this_thread_parker()};
-        auto recv_op = blocking_recv<T>(chan_, oneshot);
-        chan->pending_recvs.push(&recv_op);
+        auto oneshot = sync_oneshot();
+        auto recv_op = pending_recv<T>(&oneshot);
+        chan->push(recv_op);
         chan.unlock();
-        return recv_op.try_recv(deadline);
+        auto result = recv_op.try_recv(chan_, deadline);
+        assert(oneshot.done());
+        return result;
     }
 
   public:
-    explicit concurrent_queue(std::optional<std::size_t> capacity) : concurrent_queue_base(capacity) {}
+    explicit concurrent_queue(std::optional<std::size_t> capacity) : concurrent_queue_base(capacity), chan_(*this) {}
     auto size() -> std::size_t {
         auto chan = chan_.lock();
         return chan->queue.size();
@@ -375,64 +420,39 @@ class concurrent_queue : public concurrent_queue_base {
     auto empty() -> bool { return size() == 0; }
     auto full() -> bool { return capacity_ ? size() >= *capacity_ : false; }
 
-    void close() {
-        closed_.store(true, std::memory_order_relaxed);
-        auto chan = chan_.lock();
-        while (auto send = chan->pending_sends.pop()) {
-            send->try_resolve(op_status::closed);
-        }
-        while (auto recv = chan->pending_recvs.pop()) {
-            recv->resolve_closed();
-        }
-    }
+    void close() { chan_.lock()->close(); }
 
     // non-blocking operations
-    auto try_send(T &&msg) -> try_op_status {
-        auto chan = chan_.lock();
-        return try_send_impl(chan, std::move(msg));
-    }
-
-    auto try_send(const T &msg) -> try_op_status {
-        auto chan = chan_.lock();
-        return try_send_impl(chan, msg);
-    }
-
-    auto try_recv() -> try_recv_result<T> {
-        auto chan = chan_.lock();
-        return try_recv_impl(chan);
-    }
+    auto try_send(T &&msg) -> try_op_status { return chan_.lock()->try_send_impl(std::move(msg)); }
+    auto try_send(const T &msg) -> try_op_status { return chan_.lock()->try_send_impl(msg); }
+    auto try_recv() -> try_recv_result<T> { return chan_.lock()->try_recv_impl(); }
 
     // blocking operations
     auto send(T &&msg) -> op_status { return to_op_status(blocking_send_impl(std::move(msg))); }
     auto send(const T &msg) -> op_status { return to_op_status(blocking_send_impl(msg)); }
+    auto recv() -> recv_result<T> { return blocking_recv_impl(); }
 
     template <typename Clock, typename Duration>
     auto try_send_until(T &&msg, std::chrono::time_point<Clock, Duration> deadline) -> try_op_status {
         return blocking_send_impl(std::move(msg), deadline);
     }
-
     template <typename Clock, typename Duration>
     auto try_send_until(const T &msg, std::chrono::time_point<Clock, Duration> deadline) -> try_op_status {
         return blocking_send_impl(msg, deadline);
+    }
+    template <typename Clock, typename Duration>
+    auto try_recv_until(std::chrono::time_point<Clock, Duration> deadline) -> try_recv_result<T> {
+        return blocking_recv_impl(deadline);
     }
 
     template <typename Rep, typename Period>
     auto try_send_for(T &&msg, std::chrono::duration<Rep, Period> timeout) -> try_op_status {
         return blocking_send_impl(std::move(msg), {std::chrono::steady_clock::now() + timeout});
     }
-
     template <typename Rep, typename Period>
     auto try_send_for(const T &msg, std::chrono::duration<Rep, Period> timeout) -> try_op_status {
         return blocking_send_impl(msg, {std::chrono::steady_clock::now() + timeout});
     }
-
-    auto recv() -> recv_result<T> { return blocking_recv_impl(); }
-
-    template <typename Clock, typename Duration>
-    auto try_recv_until(std::chrono::time_point<Clock, Duration> deadline) -> try_recv_result<T> {
-        return blocking_recv_impl(deadline);
-    }
-
     template <typename Rep, typename Period>
     auto try_recv_for(std::chrono::duration<Rep, Period> timeout) -> try_recv_result<T> {
         return blocking_recv_impl({std::chrono::steady_clock::now() + timeout});
@@ -531,10 +551,10 @@ class shared_queue_base {
     std::atomic<std::size_t> rx_count_{0};
 
   protected:
-    void inc_tx() { tx_count_.fetch_add(1, std::memory_order_relaxed); }
-    void inc_rx() { rx_count_.fetch_add(1, std::memory_order_relaxed); }
-    auto dec_tx() -> bool { return tx_count_.fetch_sub(1, std::memory_order_relaxed) == 1; }
-    auto dec_rx() -> bool { return rx_count_.fetch_sub(1, std::memory_order_relaxed) == 1; }
+    void inc_tx() { tx_count_.fetch_add(1); }
+    void inc_rx() { rx_count_.fetch_add(1); }
+    auto dec_tx() -> bool { return tx_count_.fetch_sub(1) == 1; }
+    auto dec_rx() -> bool { return rx_count_.fetch_sub(1) == 1; }
 };
 
 template <typename T>
@@ -654,6 +674,8 @@ class queue_receiver {
     }
 
     ~queue_receiver() { dec(); }
+
+    explicit operator bool() { return queue_ != nullptr; }
 
     auto try_recv() -> try_recv_result<T> { return queue_->try_recv(); }
 

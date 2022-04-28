@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -32,19 +33,27 @@ class thread_parker {
         return parker;
     }
 
+    auto resumed() -> bool { return state_.load() == state::resumed; }
+
     void resume() noexcept {
-        switch (state_.exchange(state::notified)) {
+        // printf("%p resume\n", this);
+        // fflush(stdout);
+        auto old_state = state_.exchange(state::notified);
+        switch (old_state) {
             case state::suspended:
                 // lock mutex to handle case where suspended thread has set state to suspended but is not yet waiting on
                 // cvar
                 { auto lock = lock_type{mutex_}; }
                 cvar_.notify_one();
                 return;
-            case state::notified:
-                // Someone else already notified
             case state::resumed:
-                // Already resumed
+                // Already resumed (for instance due to timeout)
                 return;
+            case state::notified:
+            default:
+                // Someone else already notified, not supported!
+                assert(false);
+                std::terminate();
         }
     }
 
@@ -76,6 +85,7 @@ class thread_parker {
             case state::resumed:
             default:
                 // should never happen
+                assert(false);
                 std::terminate();
         }
     }
