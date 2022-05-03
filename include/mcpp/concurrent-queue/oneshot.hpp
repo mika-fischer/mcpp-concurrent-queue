@@ -132,7 +132,7 @@ class oneshot {
 
 class sync_oneshot : public oneshot {
   private:
-    thread_parker<> &parker_{thread_parker<>::this_thread_parker()};
+    thread_parker &parker_{thread_parker::this_thread_parker()};
 
   public:
     sync_oneshot() {
